@@ -513,13 +513,18 @@ class CosyVoice3Model(
                     left_context_size = max(0, int(info.get("left_context_size", 0))) if info else 0
                 except (TypeError, ValueError):
                     left_context_size = 0
+                n_timesteps_raw = info.get("n_timesteps", 10) if info else 10
+                try:
+                    n_timesteps = max(1, int(n_timesteps_raw))
+                except (TypeError, ValueError):
+                    n_timesteps = 10
 
                 tts_speech = self.code2wav(
                     token=token.unsqueeze(0),
                     prompt_token=speech_token[:1],
                     prompt_feat=speech_feat[:1],
                     embedding=embedding[:1],
-                    n_timesteps=10,
+                    n_timesteps=n_timesteps,
                 )
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)
                 if left_context_size > 0 and samples_per_token is not None and audio.numel() > 0:

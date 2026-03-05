@@ -108,3 +108,49 @@ def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes
     assert payload is not None
     assert payload["code_predictor_codes"] == []
     assert payload["finished"].item() is True
+
+
+def test_talker2code2wav_async_chunk_flow_first_tail_timesteps():
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        request_payload={},
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "codec_chunk_frames": 2,
+                    "codec_left_context_frames": 2,
+                    "codec_vocab_size": 6561,
+                    "flow_first_n_timesteps": 10,
+                    "flow_tail_n_timesteps": 6,
+                }
+            }
+        ),
+    )
+    request = SimpleNamespace(
+        external_req_id="rid-flow",
+        output_token_ids=[1, 2, 3, 4],
+        additional_information={
+            "speech_token": [torch.tensor([[11, 12, 13]])],
+            "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
+            "embedding": [torch.tensor([[0.5, 0.6]])],
+        },
+        is_finished=lambda: False,
+    )
+
+    payload0 = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=False,
+    )
+    assert payload0 is not None
+    assert payload0["n_timesteps"] == 10
+
+    payload1 = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=True,
+    )
+    assert payload1 is not None
+    assert payload1["n_timesteps"] == 6

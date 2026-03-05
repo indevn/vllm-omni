@@ -69,6 +69,9 @@ runtime:
         codec_chunk_frames: 25
         codec_left_context_frames: 25
         codec_vocab_size: 6561
+        # Optional flow diffusion-step tuning (vllm-omni optimization; default-off):
+        # flow_first_n_timesteps: 10
+        # flow_tail_n_timesteps: 6
 
   edges:
     - from: 0

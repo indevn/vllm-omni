@@ -61,6 +61,16 @@ def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
     return decoded
 
 
+def _as_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return None
+    return ivalue if ivalue > 0 else None
+
+
 def text2flow(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -102,6 +112,8 @@ def talker2code2wav_async_chunk(
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_cfg = int(cfg.get("codec_left_context_frames", 25))
     code_vocab_size = int(cfg.get("codec_vocab_size", 6561))
+    flow_first_n_timesteps = _as_positive_int(cfg.get("flow_first_n_timesteps"))
+    flow_tail_n_timesteps = _as_positive_int(cfg.get("flow_tail_n_timesteps"))
     if chunk_size <= 0 or left_context_size_cfg < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
@@ -175,6 +187,10 @@ def talker2code2wav_async_chunk(
         "left_context_size": left_context_size,
         "finished": torch.tensor(finished, dtype=torch.bool),
     }
+    chunk_index = int(state.get("emitted_chunks", 0))
+    n_timesteps = flow_tail_n_timesteps if chunk_index > 0 and flow_tail_n_timesteps is not None else flow_first_n_timesteps
+    if n_timesteps is not None:
+        payload["n_timesteps"] = n_timesteps
     if not state.get("sent_prompt", False):
         payload.update(state.get("prompt_payload", {}))
         state["sent_prompt"] = True
