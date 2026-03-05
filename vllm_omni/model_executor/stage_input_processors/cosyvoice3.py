@@ -71,6 +71,15 @@ def _as_positive_int(value: Any) -> int | None:
     return ivalue if ivalue > 0 else None
 
 
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def text2flow(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -114,11 +123,28 @@ def talker2code2wav_async_chunk(
     code_vocab_size = int(cfg.get("codec_vocab_size", 6561))
     flow_first_n_timesteps = _as_positive_int(cfg.get("flow_first_n_timesteps"))
     flow_tail_n_timesteps = _as_positive_int(cfg.get("flow_tail_n_timesteps"))
+    use_hop_policy = bool(cfg.get("codec_use_hop_policy", False))
+    token_overlap_len = int(cfg.get("token_overlap_len", left_context_size_cfg))
+    token_min_hop_len = int(cfg.get("token_min_hop_len", chunk_size))
+    token_max_hop_len = int(cfg.get("token_max_hop_len", token_min_hop_len))
+    stream_scale_factor = _as_float(cfg.get("stream_scale_factor")) or 1.0
+    first_hop_override = _as_positive_int(cfg.get("stream_first_token_hop_len"))
     if chunk_size <= 0 or left_context_size_cfg < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_cfg}"
         )
+    if use_hop_policy:
+        if token_overlap_len < 0:
+            raise ValueError(f"Invalid token_overlap_len={token_overlap_len}")
+        if token_min_hop_len <= 0 or token_max_hop_len <= 0:
+            raise ValueError(
+                f"Invalid hop lengths: token_min_hop_len={token_min_hop_len}, token_max_hop_len={token_max_hop_len}"
+            )
+        if token_max_hop_len < token_min_hop_len:
+            token_max_hop_len = token_min_hop_len
+        if stream_scale_factor < 1.0:
+            raise ValueError(f"Invalid stream_scale_factor={stream_scale_factor}, must be >= 1.0")
 
     request_state = transfer_manager.request_payload.get(request_id)
     if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
@@ -140,6 +166,7 @@ def talker2code2wav_async_chunk(
                 "seen_len": 0,
                 "sent_prompt": False,
                 "emitted_chunks": 0,
+                "hop_len": int(first_hop_override or token_min_hop_len),
                 "prompt_payload": prompt_payload,
             }
         }
@@ -172,15 +199,39 @@ def talker2code2wav_async_chunk(
             state["sent_prompt"] = True
         return payload
 
-    chunk_length = length % chunk_size
-    if chunk_length != 0 and not finished:
-        return None
+    if not use_hop_policy:
+        chunk_length = length % chunk_size
+        if chunk_length != 0 and not finished:
+            return None
 
-    context_length = chunk_length if chunk_length != 0 else chunk_size
-    end_index = min(length, left_context_size_cfg + context_length)
-    left_context_size = max(0, int(end_index - context_length))
-    window_frames = token_frames[-end_index:]
-    code_predictor_codes = [int(frame[0]) for frame in window_frames]
+        context_length = chunk_length if chunk_length != 0 else chunk_size
+        end_index = min(length, left_context_size_cfg + context_length)
+        left_context_size = max(0, int(end_index - context_length))
+        window_frames = token_frames[-end_index:]
+        code_predictor_codes = [int(frame[0]) for frame in window_frames]
+    else:
+        # Upstream-aligned hop cadence (default-off):
+        # - wait for hop_len + overlap tokens
+        # - emit window = [overlap_from_prev] + [new_hop]
+        # - progressive hop growth via stream_scale_factor up to token_max_hop_len
+        hop_len = int(state.get("hop_len") or token_min_hop_len)
+        hop_len = max(1, min(hop_len, token_max_hop_len))
+        overlap_len = max(0, int(token_overlap_len))
+        need = hop_len + overlap_len
+        if not finished and length < need:
+            return None
+
+        window_frames = token_frames if finished else token_frames[:need]
+        code_predictor_codes = [int(frame[0]) for frame in window_frames]
+
+        chunk_index = int(state.get("emitted_chunks", 0))
+        left_context_size = 0 if chunk_index == 0 else min(overlap_len, len(code_predictor_codes))
+
+        if not finished:
+            del token_frames[:hop_len]
+            next_hop = int(hop_len * stream_scale_factor)
+            next_hop = max(1, min(next_hop, token_max_hop_len))
+            state["hop_len"] = next_hop
 
     payload = {
         "code_predictor_codes": code_predictor_codes,

@@ -69,6 +69,14 @@ runtime:
         codec_chunk_frames: 25
         codec_left_context_frames: 25
         codec_vocab_size: 6561
+        # Upstream-aligned hop cadence (default-off). When enabled, stage-0 will
+        # emit codec windows using: first hop + overlap + progressive hop scaling.
+        codec_use_hop_policy: false
+        # token_overlap_len: 20
+        # token_min_hop_len: 50   # e.g. 2 * token_frame_rate (25Hz) => 50
+        # token_max_hop_len: 100  # e.g. 4 * token_frame_rate (25Hz) => 100
+        # stream_scale_factor: 2
+        # stream_first_token_hop_len: 25  # optional override for first chunk only
         # Optional flow diffusion-step tuning (vllm-omni optimization; default-off):
         # flow_first_n_timesteps: 10
         # flow_tail_n_timesteps: 6

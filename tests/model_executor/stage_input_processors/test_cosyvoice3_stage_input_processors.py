@@ -154,3 +154,54 @@ def test_talker2code2wav_async_chunk_flow_first_tail_timesteps():
     )
     assert payload1 is not None
     assert payload1["n_timesteps"] == 6
+
+
+def test_talker2code2wav_async_chunk_hop_policy_progressive_hop_and_overlap():
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        request_payload={},
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "codec_use_hop_policy": True,
+                    "token_overlap_len": 2,
+                    "token_min_hop_len": 3,
+                    "token_max_hop_len": 6,
+                    "stream_scale_factor": 2,
+                    "codec_vocab_size": 6561,
+                }
+            }
+        ),
+    )
+    request = SimpleNamespace(
+        external_req_id="rid-hop",
+        output_token_ids=list(range(1, 12)),
+        additional_information={
+            "speech_token": [torch.tensor([[11, 12, 13]])],
+            "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
+            "embedding": [torch.tensor([[0.5, 0.6]])],
+        },
+        is_finished=lambda: False,
+    )
+
+    payload0 = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=False,
+    )
+    assert payload0 is not None
+    assert payload0["code_predictor_codes"] == [1, 2, 3, 4, 5]
+    assert payload0["left_context_size"] == 0
+    assert payload0["finished"].item() is False
+
+    payload1 = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        pooling_output=None,
+        request=request,
+        is_finished=False,
+    )
+    assert payload1 is not None
+    assert payload1["code_predictor_codes"] == [4, 5, 6, 7, 8, 9, 10, 11]
+    assert payload1["left_context_size"] == 2
+    assert payload1["finished"].item() is False
