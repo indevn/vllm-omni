@@ -80,6 +80,22 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
 def text2flow(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -123,18 +139,24 @@ def talker2code2wav_async_chunk(
     code_vocab_size = int(cfg.get("codec_vocab_size", 6561))
     flow_first_n_timesteps = _as_positive_int(cfg.get("flow_first_n_timesteps"))
     flow_tail_n_timesteps = _as_positive_int(cfg.get("flow_tail_n_timesteps"))
-    use_hop_policy = bool(cfg.get("codec_use_hop_policy", False))
-    token_overlap_len = int(cfg.get("token_overlap_len", left_context_size_cfg))
-    token_min_hop_len = int(cfg.get("token_min_hop_len", chunk_size))
-    token_max_hop_len = int(cfg.get("token_max_hop_len", token_min_hop_len))
-    stream_scale_factor = _as_float(cfg.get("stream_scale_factor")) or 1.0
-    first_hop_override = _as_positive_int(cfg.get("stream_first_token_hop_len"))
+    use_hop_policy = _as_bool(cfg.get("codec_use_hop_policy"), default=False)
+    token_overlap_len = int(left_context_size_cfg)
+    token_min_hop_len = int(chunk_size)
+    token_max_hop_len = int(chunk_size)
+    stream_scale_factor = 1.0
+    first_hop_override = None
     if chunk_size <= 0 or left_context_size_cfg < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_cfg}"
         )
     if use_hop_policy:
+        token_overlap_len = int(cfg.get("token_overlap_len", left_context_size_cfg))
+        token_min_hop_len = int(cfg.get("token_min_hop_len", chunk_size))
+        token_max_hop_len = int(cfg.get("token_max_hop_len", token_min_hop_len))
+        stream_scale_factor = _as_float(cfg.get("stream_scale_factor")) or 1.0
+        first_hop_override = _as_positive_int(cfg.get("stream_first_token_hop_len"))
+
         if token_overlap_len < 0:
             raise ValueError(f"Invalid token_overlap_len={token_overlap_len}")
         if token_min_hop_len <= 0 or token_max_hop_len <= 0:
