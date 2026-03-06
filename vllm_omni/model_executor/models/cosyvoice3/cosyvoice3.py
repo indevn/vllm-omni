@@ -484,9 +484,7 @@ class CosyVoice3Model(
                 speech_feat = self._as_tensor(info.get("speech_feat")) if info else None
                 embedding = self._as_tensor(info.get("embedding")) if info else None
                 if speech_token is None or speech_feat is None or embedding is None:
-                    if req_ids.numel() > 0 and info and (
-                        "left_context_size" in info or "generated_len" in info
-                    ):
+                    if req_ids.numel() > 0 and info and ("left_context_size" in info or "generated_len" in info):
                         info_keys = ",".join(sorted(info.keys())) if info else ""
                         logger.warning_once(
                             "CosyVoice3 code2wav missing prompt conditioning for non-empty codec tokens: "
