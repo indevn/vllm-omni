@@ -257,14 +257,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return self.create_error_response("No output generated from the model.")
 
             # Extract audio from output
-            # Audio can be in final_output.multimodal_output or final_output.request_output.multimodal_output
-            # Support both "audio" and "model_outputs" keys for compatibility with different models
+            # Audio may be attached to:
+            # 1) OmniRequestOutput.multimodal_output
+            # 2) RequestOutput.multimodal_output
+            # 3) CompletionOutput.multimodal_output (e.g., Qwen3-TTS)
             audio_output = None
             if hasattr(final_output, "multimodal_output") and final_output.multimodal_output:
                 audio_output = final_output.multimodal_output
             if not audio_output and hasattr(final_output, "request_output"):
                 if final_output.request_output and hasattr(final_output.request_output, "multimodal_output"):
                     audio_output = final_output.request_output.multimodal_output
+            if (
+                not audio_output
+                and hasattr(final_output, "request_output")
+                and final_output.request_output
+                and hasattr(final_output.request_output, "outputs")
+            ):
+                for completion_output in final_output.request_output.outputs:
+                    mm_output = getattr(completion_output, "multimodal_output", None)
+                    if mm_output:
+                        audio_output = mm_output
+                        break
 
             # Check for audio data using either "audio" or "model_outputs" key
             audio_key = None
