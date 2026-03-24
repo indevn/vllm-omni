@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+from threading import Lock
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 
@@ -303,6 +304,9 @@ class CosyVoice3Model(
             self.mel_cache_len = self.code2wav.mel_cache_len
             self.source_cache_len = self.code2wav.source_cache_len
             self.speech_window = self.code2wav.speech_window
+            self._stream_audio_cache_by_req: dict[str, torch.Tensor] = {}
+            self._stream_audio_cache_lock = Lock()
+            self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
@@ -331,6 +335,86 @@ class CosyVoice3Model(
         if isinstance(value, torch.Tensor):
             return value
         return None
+
+    @staticmethod
+    def _as_str(value: object) -> str | None:
+        """Extract string payload from runtime info fields."""
+        if isinstance(value, list):
+            if not value:
+                return None
+            value = value[0]
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _as_bool(value: object) -> bool:
+        """Extract boolean payload from runtime info fields."""
+        if isinstance(value, list):
+            if not value:
+                return False
+            value = value[0]
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return False
+            return bool(value.reshape(-1)[0].item())
+        if value is None:
+            return False
+        return bool(value)
+
+    @staticmethod
+    def _cross_fade_audio(audio: torch.Tensor, prev_tail: torch.Tensor) -> torch.Tensor:
+        """Blend previous chunk tail into current chunk head using a Hamming window.
+
+        This mirrors upstream CosyVoice's `fade_in_out(...)` semantics:
+        update the current head in-place using a 2*overlap window, then
+        concatenate the unchanged remainder.
+        """
+        if audio.numel() == 0 or prev_tail.numel() == 0:
+            return audio
+        overlap = min(int(audio.numel()), int(prev_tail.numel()))
+        if overlap <= 0:
+            return audio
+        window = torch.hamming_window(2 * overlap, periodic=False, dtype=audio.dtype, device=audio.device)
+        fade_in = window[:overlap]
+        fade_out = window[overlap:]
+        blended = audio[:overlap] * fade_in + prev_tail[-overlap:].to(device=audio.device, dtype=audio.dtype) * fade_out
+        if overlap == int(audio.numel()):
+            return blended
+        return torch.cat([blended, audio[overlap:]], dim=0)
+
+    def _stitch_stream_audio(self, req_id: str | None, audio: torch.Tensor, stream_finished: bool) -> torch.Tensor:
+        """Mirror upstream speech-tail cache/fade semantics for async chunk stitching."""
+        if req_id is None or not hasattr(self, "_stream_audio_cache_by_req"):
+            return audio
+
+        with self._stream_audio_cache_lock:
+            prev_tail = self._stream_audio_cache_by_req.get(req_id)
+
+        if prev_tail is not None and prev_tail.numel() > 0:
+            if audio.numel() > 0:
+                audio = self._cross_fade_audio(audio, prev_tail)
+            elif stream_finished:
+                with self._stream_audio_cache_lock:
+                    cached = self._stream_audio_cache_by_req.pop(req_id, None)
+                if cached is not None:
+                    return cached.to(device=audio.device, dtype=audio.dtype)
+
+        if stream_finished:
+            with self._stream_audio_cache_lock:
+                self._stream_audio_cache_by_req.pop(req_id, None)
+            return audio
+
+        tail_len = min(int(getattr(self, "source_cache_len", 0)), int(audio.numel()))
+        if tail_len <= 0:
+            return audio
+
+        with self._stream_audio_cache_lock:
+            self._stream_audio_cache_by_req[req_id] = audio[-tail_len:].detach().cpu().contiguous()
+
+        if tail_len >= int(audio.numel()):
+            return audio[:0]
+        return audio[:-tail_len]
 
     @staticmethod
     def _split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
@@ -455,9 +539,9 @@ class CosyVoice3Model(
             empty_audio = torch.zeros((0,), dtype=torch.float32, device=input_ids.device)
             audios: list[torch.Tensor] = [empty_audio] * num_reqs
             srs: list[torch.Tensor] = [sample_rate] * num_reqs
+            # Token-aligned upper bound for waveform length (for safety/debuggability).
             samples_per_token: int | None = None
             try:
-                # Prefer vocoder-derived stride: prod(upsample_rates) * hop_len * token_mel_ratio.
                 hift_cfg = getattr(self.config, "hift", {}) or {}
                 up_rates = list(hift_cfg.get("upsample_rates") or [])
                 hop_len = int((hift_cfg.get("istft_params") or {}).get("hop_len", 0))
@@ -467,11 +551,6 @@ class CosyVoice3Model(
                     for u in up_rates:
                         stride *= int(u)
                     samples_per_token = stride * hop_len * token_mel_ratio
-                else:
-                    token_hz = int(getattr(self.config, "token_frame_rate", 0))
-                    sr_val = int(self.config.sample_rate)
-                    if token_hz > 0 and sr_val % token_hz == 0:
-                        samples_per_token = sr_val // token_hz
             except Exception:
                 samples_per_token = None
 
@@ -480,10 +559,16 @@ class CosyVoice3Model(
 
             for idx, req_ids in enumerate(request_ids_list):
                 info = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
+                req_id = self._as_str(info.get("req_id")) if info else None
+                stream_finished = self._as_bool(info.get("stream_finished")) if info else False
                 speech_token = self._as_tensor(info.get("speech_token")) if info else None
                 speech_feat = self._as_tensor(info.get("speech_feat")) if info else None
                 embedding = self._as_tensor(info.get("embedding")) if info else None
                 if speech_token is None or speech_feat is None or embedding is None:
+                    if stream_finished and req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
+                        with self._stream_audio_cache_lock:
+                            self._stream_vocoder_cache_by_req.pop(req_id, None)
+                    audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
                     if req_ids.numel() > 0 and info and ("left_context_size" in info or "generated_len" in info):
                         info_keys = ",".join(sorted(info.keys())) if info else ""
                         logger.warning_once(
@@ -496,6 +581,7 @@ class CosyVoice3Model(
 
                 token = self._sanitize_codec_tokens(req_ids)
                 if token.numel() == 0:
+                    audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
                     if req_ids.numel() > 0:
                         logger.warning_once(
                             "CosyVoice3 code2wav received no valid codec tokens after filtering: "
@@ -512,36 +598,38 @@ class CosyVoice3Model(
                 except (TypeError, ValueError):
                     left_context_size = 0
 
-                tts_speech = self.code2wav(
+                token_len = int(token.numel())
+                effective_ctx = min(left_context_size, token_len)
+                expected_after_ctx = None
+                if samples_per_token is not None and token_len > 0:
+                    expected_after_ctx = (token_len - effective_ctx) * samples_per_token
+                # Always trim left-context in the mel domain (token_offset semantics),
+                # then apply chunk-level stitching as a post-process. This matches
+                # upstream CosyVoice streaming: overlap is handled by cached tails
+                # rather than hard waveform crops at the boundary.
+                feat = self.code2wav._forward_mel(
                     token=token.unsqueeze(0),
                     prompt_token=speech_token[:1],
                     prompt_feat=speech_feat[:1],
                     embedding=embedding[:1],
                     n_timesteps=10,
+                    token_offset_tokens=left_context_size,
                 )
-                audio = tts_speech.reshape(-1).to(dtype=torch.float32)
-                token_len = int(token.numel())
-                if samples_per_token is not None and token_len > 0 and audio.numel() > 0:
-                    expected_total = token_len * samples_per_token
-                    if audio.numel() > expected_total:
-                        audio = audio[:expected_total]
-                if left_context_size > 0 and samples_per_token is None and audio.numel() > 0:
-                    logger.warning_once(
-                        "CosyVoice3 code2wav cannot trim left context because samples_per_token is unavailable: "
-                        "left_context_size=%d sample_rate=%d",
-                        left_context_size,
-                        int(self.config.sample_rate),
-                    )
-                if left_context_size > 0 and samples_per_token is not None and audio.numel() > 0:
-                    crop = left_context_size * samples_per_token
-                    if crop > 0:
-                        audio = audio[crop:] if crop < audio.numel() else audio[:0]
-                if samples_per_token is not None and token_len > 0 and audio.numel() > 0:
-                    effective_ctx = min(left_context_size, token_len)
-                    expected_after_ctx = (token_len - effective_ctx) * samples_per_token
-                    if audio.numel() > expected_after_ctx:
-                        audio = audio[:expected_after_ctx]
-                audios[idx] = audio
+                hift_weight = self.code2wav.hift.m_source.l_linear.weight
+                tts_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+                if tts_mel.shape[-1] == 0:
+                    audio = empty_audio
+                else:
+                    # Upstream-like causal behavior: non-final chunks keep
+                    # causal trimming enabled to reduce boundary artifacts.
+                    tts_speech, _ = self.code2wav.hift.inference(speech_feat=tts_mel, finalize=stream_finished)
+                    audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+
+                # Cap to token-derived post-trim span when available.
+                if expected_after_ctx is not None and audio.numel() > expected_after_ctx:
+                    audio = audio[:expected_after_ctx]
+
+                audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)
 
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
         else:
