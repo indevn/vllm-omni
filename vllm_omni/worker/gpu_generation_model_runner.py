@@ -35,6 +35,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.profiling.worker_torch_profiler import worker_profiler_step
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -264,6 +265,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
+            worker_profiler_step("code2wav:execute_model"),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,

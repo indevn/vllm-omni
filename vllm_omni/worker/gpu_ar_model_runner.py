@@ -35,6 +35,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.profiling.worker_torch_profiler import worker_profiler_step
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
@@ -259,6 +260,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
+            worker_profiler_step("ar:execute_model"),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -370,6 +372,26 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self.kv_connector_output = kv_connector_output
 
         return None
+
+    def _sample(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: Any,
+    ):
+        sampling_metadata = self.input_batch.sampling_metadata
+        if spec_decode_metadata is None:
+            self.input_batch.update_async_output_token_ids()
+            model_sample = getattr(self.model, "sample", None)
+            if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
+                sampler_output = model_sample(logits, sampling_metadata)
+                if sampler_output is not None:
+                    return sampler_output
+            return self.sampler(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+
+        return super()._sample(logits, spec_decode_metadata)
 
     @torch.inference_mode()
     def sample_tokens(
