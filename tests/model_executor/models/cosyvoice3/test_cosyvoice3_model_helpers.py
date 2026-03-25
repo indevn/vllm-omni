@@ -384,5 +384,77 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     out = runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
 
     assert out is expected
-    assert runner.input_batch.updated is True
+    assert runner.input_batch.updated is False
     assert len(calls) == 1
+
+
+def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
+    metadata = _make_sampling_metadata(output_token_ids=[])
+    seen_histories: list[list[list[int]]] = []
+
+    class _DummyInputBatch:
+        def __init__(self):
+            self.sampling_metadata = metadata
+            self.req_output_token_ids = [[1, 2, 3]]
+            self.req_ids = ["rid-1"]
+            self.sampled_token_ids_cpu = None
+            self.async_copy_ready_event = None
+            self.prev_req_id_to_index = None
+
+        def update_async_output_token_ids(self):
+            raise AssertionError("fallback async repair should not run for model sampler path")
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.input_batch = _DummyInputBatch()
+    runner.model = SimpleNamespace(
+        prefer_model_sampler=True,
+        sample=lambda logits, sampling_metadata: seen_histories.append(
+            [list(x) for x in sampling_metadata.output_token_ids]
+        )
+        or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None),
+    )
+    runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
+
+    runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
+
+    assert seen_histories == [[[1, 2, 3]]]
+
+
+def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
+    metadata = _make_sampling_metadata(output_token_ids=[])
+    seen_histories: list[list[list[int]]] = []
+
+    class _ReadyEvent:
+        def __init__(self):
+            self.synced = False
+
+        def synchronize(self):
+            self.synced = True
+
+    class _DummyInputBatch:
+        def __init__(self):
+            self.sampling_metadata = metadata
+            self.req_output_token_ids = [[11, -1]]
+            self.req_ids = ["rid-1"]
+            self.sampled_token_ids_cpu = torch.tensor([[29]], dtype=torch.int32)
+            self.async_copy_ready_event = _ReadyEvent()
+            self.prev_req_id_to_index = {"rid-1": 0}
+
+        def update_async_output_token_ids(self):
+            raise AssertionError("fallback async repair should not run for model sampler path")
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.input_batch = _DummyInputBatch()
+    runner.model = SimpleNamespace(
+        prefer_model_sampler=True,
+        sample=lambda logits, sampling_metadata: seen_histories.append(
+            [list(x) for x in sampling_metadata.output_token_ids]
+        )
+        or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None),
+    )
+    runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
+
+    runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
+
+    assert runner.input_batch.async_copy_ready_event.synced is True
+    assert seen_histories == [[[11, 29]]]
