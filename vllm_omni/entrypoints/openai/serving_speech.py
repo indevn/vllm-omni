@@ -24,7 +24,6 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateSpeechRequest,
 )
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.profiling.markers import cuda_profiler_api_range, null_or_range
 
 logger = init_logger(__name__)
 
@@ -340,8 +339,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return np.asarray(audio, dtype=np.float32), int(sr)
 
         loop = asyncio.get_running_loop()
-        with null_or_range("openai:speech:resolve_ref_audio"):
-            wav_np, sr = await loop.run_in_executor(None, _fetch_sync)
+        wav_np, sr = await loop.run_in_executor(None, _fetch_sync)
         return wav_np.tolist(), sr
 
     async def _generate_pcm_chunks(self, generator, request_id: str):
@@ -363,49 +361,44 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         sample_rate_val = 24000
         try:
-            with cuda_profiler_api_range("openai:speech:stream"):
-                async for res in generator:
-                    with null_or_range("openai:speech:stream_step"):
-                        audio_output, audio_key = self._extract_audio_output(res)
-                        if audio_key is None:
-                            continue
+            async for res in generator:
+                audio_output, audio_key = self._extract_audio_output(res)
+                if audio_key is None:
+                    continue
 
-                        sr_raw = audio_output.get("sr")
-                        if sr_raw is not None:
-                            sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-                            sample_rate_val = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                sr_raw = audio_output.get("sr")
+                if sr_raw is not None:
+                    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                    sample_rate_val = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
-                        audio_val = audio_output[audio_key]
-                        if isinstance(audio_val, list):
-                            # Cumulative mode: each update grows the list; emit only new tail.
-                            new_chunks = audio_val[prev_count:]
-                            prev_count = len(audio_val)
-                        else:
-                            # Per-step mode: each update is a single tensor; emit directly.
-                            if audio_val is not None:
-                                new_chunks = [audio_val]
-                                prev_count += 1
-                            else:
-                                new_chunks = []
+                audio_val = audio_output[audio_key]
+                if isinstance(audio_val, list):
+                    # Cumulative mode: each update grows the list; emit only new tail.
+                    new_chunks = audio_val[prev_count:]
+                    prev_count = len(audio_val)
+                else:
+                    # Per-step mode: each update is a single tensor; emit directly.
+                    if audio_val is not None:
+                        new_chunks = [audio_val]
+                        prev_count += 1
+                    else:
+                        new_chunks = []
 
-                        for chunk_tensor in new_chunks:
-                            with null_or_range("openai:speech:chunk_to_pcm"):
-                                chunk_np = (
-                                    chunk_tensor.float().detach().cpu().numpy()
-                                    if hasattr(chunk_tensor, "float")
-                                    else chunk_tensor
-                                )
-                                if chunk_np.ndim > 1:
-                                    chunk_np = chunk_np.squeeze()
-                                audio_obj = CreateAudio(
-                                    audio_tensor=chunk_np,
-                                    sample_rate=sample_rate_val,
-                                    response_format="pcm",
-                                    speed=1.0,
-                                    stream_format="audio",
-                                    base64_encode=False,
-                                )
-                                yield self.create_audio(audio_obj).audio_data
+                for chunk_tensor in new_chunks:
+                    chunk_np = (
+                        chunk_tensor.float().detach().cpu().numpy() if hasattr(chunk_tensor, "float") else chunk_tensor
+                    )
+                    if chunk_np.ndim > 1:
+                        chunk_np = chunk_np.squeeze()
+                    audio_obj = CreateAudio(
+                        audio_tensor=chunk_np,
+                        sample_rate=sample_rate_val,
+                        response_format="pcm",
+                        speed=1.0,
+                        stream_format="audio",
+                        base64_encode=False,
+                    )
+                    yield self.create_audio(audio_obj).audio_data
         except asyncio.CancelledError:
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
@@ -531,24 +524,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
 
         try:
-            with null_or_range("openai:speech:build_prompt"):
-                if self._is_tts:
-                    # Validate TTS parameters
-                    validation_error = self._validate_tts_request(request)
-                    if validation_error:
-                        return self.create_error_response(validation_error)
+            if self._is_tts:
+                # Validate TTS parameters
+                validation_error = self._validate_tts_request(request)
+                if validation_error:
+                    return self.create_error_response(validation_error)
 
-                    tts_params = self._build_tts_params(request)
-                    if request.ref_audio is not None:
-                        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                        tts_params["ref_audio"] = [[wav_list, sr]]
+                tts_params = self._build_tts_params(request)
+                if request.ref_audio is not None:
+                    wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                    tts_params["ref_audio"] = [[wav_list, sr]]
 
-                    # Prompt length must match model-side embeddings; values are placeholders.
-                    ph_len = self._estimate_prompt_len(tts_params)
-                    prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
-                else:
-                    tts_params = {}
-                    prompt = {"prompt": request.input}
+                # Prompt length must match model-side embeddings; values are placeholders.
+                ph_len = self._estimate_prompt_len(tts_params)
+                prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+            else:
+                tts_params = {}
+                prompt = {"prompt": request.input}
 
             logger.info(
                 "TTS speech request %s: text=%r, task_type=%s",
@@ -574,9 +566,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             # Non-streaming: collect final output
             final_output: OmniRequestOutput | None = None
-            with cuda_profiler_api_range("openai:speech:non_stream"):
-                async for res in generator:
-                    final_output = res
+            async for res in generator:
+                final_output = res
 
             if final_output is None:
                 return self.create_error_response("No output generated from the model.")
@@ -591,15 +582,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
             # async_chunk mode accumulates chunks as a list; concat first.
-            with null_or_range("openai:speech:finalize_audio"):
-                if isinstance(audio_tensor, list):
-                    import torch
+            if isinstance(audio_tensor, list):
+                import torch
 
-                    audio_tensor = torch.cat(audio_tensor, dim=-1)
-                if hasattr(audio_tensor, "float"):
-                    audio_tensor = audio_tensor.float().detach().cpu().numpy()
-                if audio_tensor.ndim > 1:
-                    audio_tensor = audio_tensor.squeeze()
+                audio_tensor = torch.cat(audio_tensor, dim=-1)
+            if hasattr(audio_tensor, "float"):
+                audio_tensor = audio_tensor.float().detach().cpu().numpy()
+            if audio_tensor.ndim > 1:
+                audio_tensor = audio_tensor.squeeze()
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,

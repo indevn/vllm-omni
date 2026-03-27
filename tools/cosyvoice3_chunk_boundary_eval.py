@@ -163,10 +163,17 @@ class SimpleOmniRunner:
         mm_processor_kwargs: dict[str, Any] | None,
         modalities: list[str] | None,
     ) -> list[dict[str, Any]]:
+        user_content = "<|audio_bos|><|audio_pad|><|audio_eos|>" + prompt
+        full_prompt = (
+            "<|im_start|>system\n"
+            "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+            "capable of perceiving auditory and visual inputs, as well as generating text and speech."
+            "<|im_end|>\n"
+            f"<|im_start|>user\n{user_content}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
         payload: dict[str, Any] = {
-            # CosyVoice3 zero-shot expects raw synthesis text + prompt_text,
-            # matching upstream inference_zero_shot(tts_text, prompt_text, prompt_wav).
-            "prompt": prompt,
+            "prompt": full_prompt,
             "multi_modal_data": {"audio": audios},
         }
         if modalities:
