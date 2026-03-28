@@ -251,20 +251,47 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             elif finished_flag is not None:
                 is_payload_finished = bool(finished_flag)
 
-            # Reclaim per-request async state only after the terminal payload
+            # Reclaim sender-side async state only after the terminal payload
             # has been sent successfully. This avoids cleanup->save races.
             if is_payload_finished:
-                self.cleanup(request.request_id, external_req_id)
-
-        if is_finished:
-            self.code_prompt_token_ids.pop(external_req_id, None)
-            cached_ic = getattr(self, "_cached_ic", None)
-            if cached_ic is not None:
-                cached_ic.pop(external_req_id, None)
+                self.cleanup_sender(external_req_id)
 
     ########################################################################
     # Cleanup
     ########################################################################
+
+    def cleanup_receiver(self, request_id: str) -> None:
+        """Reclaim receiver-side per-request state (keyed by internal id).
+
+        Safe to call from the scheduler even when ``save_async()`` has
+        enqueued work that the background thread has not yet processed,
+        because it only touches receiver-side dictionaries.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.finished_requests.discard(request_id)
+        self.get_req_chunk.pop(request_id, None)
+        self.requests_with_ready_chunks.discard(request_id)
+        self.request_ids_mapping.pop(request_id, None)
+
+        self._cancelled_load_reqs.add(request_id)
+        self._finished_load_reqs.discard(request_id)
+
+    def cleanup_sender(self, external_req_id: str) -> None:
+        """Reclaim sender-side per-request state (keyed by external id).
+
+        Must only be called after the terminal chunk has actually been
+        sent (i.e. from ``_send_single_request``), not before.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.put_req_chunk.pop(external_req_id, None)
+        self.request_payload.pop(external_req_id, None)
+        self.code_prompt_token_ids.pop(external_req_id, None)
+
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
 
     def cleanup(
         self,
@@ -283,21 +310,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if external_req_id is None:
             external_req_id = self.request_ids_mapping.get(request_id, request_id)
 
-        self.finished_requests.discard(request_id)
-        self.get_req_chunk.pop(request_id, None)
-        self.requests_with_ready_chunks.discard(request_id)
-        self.request_ids_mapping.pop(request_id, None)
-
-        self._cancelled_load_reqs.add(request_id)
-        self._finished_load_reqs.discard(request_id)
-
-        self.put_req_chunk.pop(external_req_id, None)
-        self.request_payload.pop(external_req_id, None)
-        self.code_prompt_token_ids.pop(external_req_id, None)
-
-        cached_ic = getattr(self, "_cached_ic", None)
-        if cached_ic is not None:
-            cached_ic.pop(external_req_id, None)
+        self.cleanup_receiver(request_id)
+        self.cleanup_sender(external_req_id)
 
     ########################################################################
     # Schedule Helper
