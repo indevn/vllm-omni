@@ -214,9 +214,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
-        request_id = request.external_req_id
-        chunk_id = self.put_req_chunk[request_id]
-        connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
+        external_req_id = request.external_req_id
+        chunk_id = self.put_req_chunk[external_req_id]
+        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data = None
         if self.custom_process_next_stage_input_func:
@@ -242,7 +242,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         if success:
-            self.put_req_chunk[request_id] += 1
+            self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             finished_flag = payload_data.get("finished")
             is_payload_finished = False
@@ -254,13 +254,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Reclaim per-request async state only after the terminal payload
             # has been sent successfully. This avoids cleanup->save races.
             if is_payload_finished:
-                self.cleanup(request.request_id, request_id)
+                self.cleanup(request.request_id, external_req_id)
 
         if is_finished:
-            self.code_prompt_token_ids.pop(request_id, None)
+            self.code_prompt_token_ids.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
-                cached_ic.pop(request_id, None)
+                cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Cleanup
