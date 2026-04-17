@@ -48,6 +48,9 @@ _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _TTS_MODEL_STAGES: set[str] = _VOXTRAL_TTS_MODEL_STAGES | _QWEN3_TTS_MODEL_STAGES | _FISH_TTS_MODEL_STAGES
+# CosyVoice3 is detected by model_arch, not model_stage, because "talker" is
+# shared with Qwen2.5-Omni and Qwen3-Omni which are not TTS-only models.
+_COSYVOICE3_MODEL_ARCH = "CosyVoice3Model"
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -165,6 +168,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         self._fish_speech_tokenizer = None
 
+        # Detect CosyVoice3 model
+        self._is_cosyvoice3 = self._find_cosyvoice3_stage() is not None
+
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
 
@@ -226,6 +232,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Find and return the TTS stage config, or None if not found."""
         for stage in self.engine_client.stage_configs:
             if stage.engine_args.model_stage in _TTS_MODEL_STAGES:
+                return stage
+        return None
+
+    def _find_cosyvoice3_stage(self):
+        """Find and return the CosyVoice3 talker stage config, or None if not found.
+
+        Detection uses model_arch rather than model_stage because "talker" is
+        shared with Qwen2.5-Omni and Qwen3-Omni stage configs.
+        """
+        for stage in self.engine_client.stage_configs:
+            if getattr(stage.engine_args, "model_arch", None) == _COSYVOICE3_MODEL_ARCH:
                 return stage
         return None
 
@@ -1097,6 +1114,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    # ---- CosyVoice3 helpers ----
+
+    async def _build_cosyvoice3_prompt(self, request: OpenAICreateSpeechRequest) -> dict:
+        """Build CosyVoice3 prompt from the speech request.
+
+        CosyVoice3 uses a multimodal prompt format:
+          - prompt: text to synthesize
+          - multi_modal_data.audio: reference audio waveform (for voice cloning)
+          - mm_processor_kwargs.prompt_text: transcript of the reference audio
+        """
+        import numpy as np
+
+        prompt: dict = {"prompt": request.input}
+        if request.ref_audio is not None:
+            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            wav_np = np.array(wav_list, dtype=np.float32)
+            prompt["multi_modal_data"] = {"audio": (wav_np, sr)}
+            prompt["modalities"] = ["audio"]
+            if request.ref_text:
+                prompt["mm_processor_kwargs"] = {"prompt_text": request.ref_text}
+        return prompt
+
     # ---- Voxtral TTS helpers ----
 
     async def _build_voxtral_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -1214,6 +1253,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ref_audio_data = (wav_list, sr)
             prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
             tts_params = {}
+        elif self._is_cosyvoice3:
+            prompt = await self._build_cosyvoice3_prompt(request)
+            tts_params = {}
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -1243,6 +1285,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
         if self._is_fish_speech:
             model_type = "fish_speech"
+        elif self._is_cosyvoice3:
+            model_type = "cosyvoice3"
         elif self._tts_model_type == "voxtral_tts":
             model_type = "voxtral_tts"
         elif self._is_tts:
