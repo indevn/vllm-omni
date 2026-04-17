@@ -9,6 +9,19 @@ stage_args:
     runtime:
       devices: 0
       max_batch_size: 1
+    # Stage-0 (talker) sampling defaults.
+    # temperature/top_p/top_k/repetition_penalty match the upstream CosyVoice3
+    # reference implementation. max_tokens is a conservative upper bound;
+    # the serving layer overrides min_tokens/max_tokens per-request based on
+    # input text length using config.min_token_text_ratio / max_token_text_ratio.
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.8
+      top_k: 25
+      repetition_penalty: 2.0
+      stop_token_ids: [6562]
+      max_tokens: 4096
+      detokenize: false
     engine_args:
       model_stage: talker
       model_arch: CosyVoice3Model

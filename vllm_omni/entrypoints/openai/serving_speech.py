@@ -1116,6 +1116,45 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     # ---- CosyVoice3 helpers ----
 
+    def _cosyvoice3_sampling_params(self, text: str) -> Any:
+        """Build per-request SamplingParams for CosyVoice3 stage-0.
+
+        min_tokens / max_tokens are derived from input text length using the
+        same ratios as the upstream CosyVoice3 reference implementation.
+        The base temperature / top_p / top_k / repetition_penalty come from
+        the stage config default_sampling_params (set in cosyvoice3*.yaml).
+        """
+        import copy
+
+        from vllm.sampling_params import SamplingParams
+
+        try:
+            from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
+            from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
+
+            config = CosyVoice3Config()
+            model_dir = self.engine_client.model_config.model
+            tokenizer = get_qwen_tokenizer(
+                token_path=f"{model_dir}/{config.qwen_pretrain_path}",
+                skip_special_tokens=config.skip_special_tokens,
+                version=config.version,
+            )
+            text_len = max(1, len(tokenizer.encode(text, allowed_special=config.allowed_special)))
+            min_tokens = int(text_len * config.min_token_text_ratio)
+            max_tokens = int(text_len * config.max_token_text_ratio)
+        except Exception as e:
+            logger.warning("CosyVoice3: failed to compute token length bounds, using defaults: %s", e)
+            min_tokens = 64
+            max_tokens = 4096
+
+        sampling_params_list = self.engine_client.default_sampling_params_list
+        if sampling_params_list:
+            sp = copy.deepcopy(sampling_params_list[0])
+            sp.min_tokens = min_tokens
+            sp.max_tokens = max_tokens
+            return [sp] + list(sampling_params_list[1:])
+        return [SamplingParams(min_tokens=min_tokens, max_tokens=max_tokens)]
+
     async def _build_cosyvoice3_prompt(self, request: OpenAICreateSpeechRequest) -> dict:
         """Build CosyVoice3 prompt from the speech request.
 
@@ -1301,6 +1340,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
 
         sampling_params_list = self.engine_client.default_sampling_params_list
+
+        # CosyVoice3: override min/max_tokens per-request based on text length.
+        if self._is_cosyvoice3:
+            sampling_params_list = self._cosyvoice3_sampling_params(request.input)
 
         # Fish defaults come from stage_configs YAML. Only override when the caller
         # explicitly requests a different generation length.
