@@ -127,7 +127,7 @@ def _make_sampling_metadata(
         generators={},
         max_num_logprobs=None,
         no_penalties=False,
-        prompt_token_ids=None,
+        prompt_token_ids=torch.empty((1, 0), dtype=torch.long),
         frequency_penalties=torch.zeros(1, dtype=torch.float32),
         presence_penalties=torch.zeros(1, dtype=torch.float32),
         repetition_penalties=torch.tensor([repetition_penalty], dtype=torch.float32),
@@ -395,6 +395,17 @@ def test_sample_tolerates_ras_fallback_with_no_valid_candidates():
 
     assert out is not None
     assert out.sampled_token_ids.tolist() == [[0]]
+
+
+def test_sample_applies_repetition_penalty_before_ras():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1]])
+    logits = torch.tensor([[-1e9, 8.0, 5.0]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[2]]
 
 
 def test_sample_maps_any_cosyvoice3_stop_token_to_canonical_eos():
