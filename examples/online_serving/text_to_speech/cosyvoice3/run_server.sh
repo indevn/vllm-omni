@@ -1,28 +1,57 @@
 #!/bin/bash
-# Launch vLLM-Omni server for CosyVoice3 TTS
+# Launch vLLM-Omni server for CosyVoice3 online serving.
 #
 # Usage:
-#   ./run_server.sh
-#   CUDA_VISIBLE_DEVICES=0 ./run_server.sh
+#   ./run_server.sh        # async_chunk mode (default)
+#   ./run_server.sh async
+#   ./run_server.sh sync   # legacy full-sequence code2wav path
 #
-# Streaming (async-chunk) is on by default via vllm_omni/deploy/cosyvoice3.yaml.
-# Set NO_ASYNC_CHUNK=1 to use the legacy synchronous path.
+# Environment overrides:
+#   COSYVOICE3_MODEL=/path/or/hf-repo
+#   COSYVOICE3_TOKENIZER=/path/to/CosyVoice-BlankEN
+#   COSYVOICE3_PORT=8091
+#   COSYVOICE3_DEPLOY_CONFIG=/path/to/cosyvoice3.yaml
+#   VLLM_OMNI_BIN=vllm-omni
 
-set -e
+set -euo pipefail
 
-MODEL="${MODEL:-FunAudioLLM/Fun-CosyVoice3-0.5B-2512}"
-PORT="${PORT:-8091}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
 
+MODE="${1:-async}"
+VLLM_OMNI_BIN="${VLLM_OMNI_BIN:-vllm-omni}"
+MODEL="${COSYVOICE3_MODEL:-FunAudioLLM/Fun-CosyVoice3-0.5B-2512}"
+TOKENIZER="${COSYVOICE3_TOKENIZER:-${MODEL}/CosyVoice-BlankEN}"
+PORT="${COSYVOICE3_PORT:-8091}"
+DEPLOY_CONFIG="${COSYVOICE3_DEPLOY_CONFIG:-${REPO_ROOT}/vllm_omni/deploy/cosyvoice3.yaml}"
 EXTRA_ARGS=()
-if [[ -n "${NO_ASYNC_CHUNK:-}" ]]; then
-    EXTRA_ARGS+=(--no-async-chunk)
-fi
 
-echo "Starting CosyVoice3 server with model: $MODEL"
+case "${MODE}" in
+    async|async_chunk)
+        ;;
+    sync)
+        EXTRA_ARGS+=("--no-async-chunk")
+        ;;
+    *)
+        echo "Unknown mode: ${MODE}"
+        echo "Supported modes: async, async_chunk, sync"
+        exit 1
+        ;;
+esac
 
-vllm serve "$MODEL" \
+echo "Starting CosyVoice3 server"
+echo "  model: ${MODEL}"
+echo "  tokenizer: ${TOKENIZER}"
+echo "  mode: ${MODE}"
+echo "  port: ${PORT}"
+
+"${VLLM_OMNI_BIN}" serve "${MODEL}" \
+    --tokenizer "${TOKENIZER}" \
+    --deploy-config "${DEPLOY_CONFIG}" \
     --host 0.0.0.0 \
-    --port "$PORT" \
+    --port "${PORT}" \
     --trust-remote-code \
+    --stage-init-timeout 900 \
+    --init-timeout 1200 \
     --omni \
     "${EXTRA_ARGS[@]}"

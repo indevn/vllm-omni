@@ -1,140 +1,153 @@
-"""Client for CosyVoice3 TTS via /v1/audio/speech endpoint.
-
-CosyVoice3 has no built-in voice presets: every request is voice cloning
-driven by ``ref_audio`` + ``ref_text``. The defaults below point at the
-official upstream zero-shot prompt so the script runs out of the box.
+"""OpenAI-compatible client for CosyVoice3 via /v1/audio/speech.
 
 Examples:
-    # Voice cloning with the default upstream prompt
-    python speech_client.py --text "收到好友从远方寄来的生日礼物。"
+    python speech_client.py \
+        --text "CosyVoice is undergoing a comprehensive upgrade." \
+        --ref-audio https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav \
+        --ref-text "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。" \
+        --output cosyvoice3_output.wav
 
-    # Custom reference clip + transcript
-    python speech_client.py --text "Hello, this is a cloned voice." \
+    python speech_client.py \
+        --text "CosyVoice streaming over HTTP." \
         --ref-audio /path/to/reference.wav \
-        --ref-text "Transcript of the reference audio."
-
-    # Streaming PCM output
-    python speech_client.py --text "Hello world" --stream --output output.pcm
+        --ref-text "Reference transcript." \
+        --stream \
+        --output cosyvoice3_output.pcm
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
-import os
-
-import httpx
+import json
+from pathlib import Path
+from typing import Any
 
 DEFAULT_API_BASE = "http://localhost:8091"
 DEFAULT_API_KEY = "EMPTY"
 DEFAULT_MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
-# Official CosyVoice zero-shot prompt and its transcript.
-DEFAULT_REF_AUDIO = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
-DEFAULT_REF_TEXT = "希望你以后能够做的比我还好呦。"
+MIME_BY_SUFFIX = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+}
 
 
 def encode_audio_to_base64(audio_path: str) -> str:
-    """Encode a local audio file to a base64 data URL."""
-    if not os.path.exists(audio_path):
+    """Encode a local audio file as a data URL."""
+    path = Path(audio_path)
+    if not path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    ext = audio_path.lower().rsplit(".", 1)[-1]
-    mime_map = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac", "ogg": "audio/ogg"}
-    mime_type = mime_map.get(ext, "audio/wav")
-    with open(audio_path, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    mime_type = MIME_BY_SUFFIX.get(path.suffix.lower(), "audio/wav")
+    audio_b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
     return f"data:{mime_type};base64,{audio_b64}"
 
 
-def run_tts(args) -> None:
-    """Generate speech via the /v1/audio/speech API."""
-    payload = {
+def normalize_ref_audio(ref_audio: str) -> str:
+    """Return a server-consumable reference audio URI."""
+    if ref_audio.startswith(("http://", "https://", "data:", "file:")):
+        return ref_audio
+    return encode_audio_to_base64(ref_audio)
+
+
+def build_payload(args: argparse.Namespace) -> dict[str, Any]:
+    response_format = "pcm" if args.stream else args.response_format
+    payload: dict[str, Any] = {
         "model": args.model,
         "input": args.text,
-        "response_format": args.response_format,
+        "ref_audio": normalize_ref_audio(args.ref_audio),
+        "ref_text": args.ref_text,
+        "response_format": response_format,
     }
-
-    if args.ref_audio.startswith(("http://", "https://")):
-        payload["ref_audio"] = args.ref_audio
-    else:
-        payload["ref_audio"] = encode_audio_to_base64(args.ref_audio)
-    payload["ref_text"] = args.ref_text
 
     if args.stream:
         payload["stream"] = True
-        payload["response_format"] = "pcm"
+    if args.seed is not None:
+        payload["seed"] = args.seed
+    if args.max_new_tokens is not None:
+        payload["max_new_tokens"] = args.max_new_tokens
+    if args.extra_params is not None:
+        payload["extra_params"] = json.loads(args.extra_params)
 
-    print(f"Model: {args.model}")
-    print(f"Text: {args.text}")
-    print(f"Voice cloning: ref_audio={args.ref_audio}, ref_text={args.ref_text}")
-    print("Generating audio...")
+    return payload
 
+
+def run_tts(args: argparse.Namespace) -> None:
+    try:
+        import httpx
+    except ImportError:
+        raise SystemExit("Please install httpx: pip install httpx") from None
+
+    payload = build_payload(args)
     api_url = f"{args.api_base}/v1/audio/speech"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {args.api_key}",
     }
 
+    print(f"Model: {args.model}")
+    print(f"Text: {args.text}")
+    print(f"Reference audio: {args.ref_audio}")
+    print("Generating audio...")
+
+    output_path = args.output or ("cosyvoice3_output.pcm" if args.stream else "cosyvoice3_output.wav")
     if args.stream:
-        output_path = args.output or "output.pcm"
-        with httpx.Client(timeout=300.0) as client:
-            with client.stream("POST", api_url, json=payload, headers=headers) as resp:
-                if resp.status_code != 200:
-                    print(f"Error: {resp.status_code}")
-                    print(resp.read().decode())
-                    return
+        with httpx.Client(timeout=300.0, trust_env=False) as client:
+            with client.stream("POST", api_url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    raise SystemExit(f"Error {response.status_code}: {response.read().decode(errors='ignore')}")
                 total_bytes = 0
                 with open(output_path, "wb") as f:
-                    for chunk in resp.iter_bytes():
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
                         f.write(chunk)
                         total_bytes += len(chunk)
-                print(f"Streamed {total_bytes} bytes to: {output_path}")
-    else:
-        with httpx.Client(timeout=300.0) as client:
-            response = client.post(api_url, json=payload, headers=headers)
+        print(f"Streamed {total_bytes} bytes to: {output_path}")
+        return
 
-        if response.status_code != 200:
-            print(f"Error: {response.status_code}")
-            print(response.text)
-            return
+    with httpx.Client(timeout=300.0, trust_env=False) as client:
+        response = client.post(api_url, json=payload, headers=headers)
 
-        try:
-            text = response.content.decode("utf-8")
-            if text.startswith('{"error"'):
-                print(f"Error: {text}")
-                return
-        except UnicodeDecodeError:
-            pass
+    if response.status_code != 200:
+        raise SystemExit(f"Error {response.status_code}: {response.text}")
 
-        output_path = args.output or "output.wav"
-        with open(output_path, "wb") as f:
-            f.write(response.content)
-        print(f"Audio saved to: {output_path}")
+    Path(output_path).write_bytes(response.content)
+    print(f"Audio saved to: {output_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="CosyVoice3 TTS client")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CosyVoice3 OpenAI-compatible speech client")
     parser.add_argument("--api-base", default=DEFAULT_API_BASE, help="API base URL")
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key")
-    parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help="Model name")
+    parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help="Model name or path")
     parser.add_argument("--text", required=True, help="Text to synthesize")
+    parser.add_argument("--ref-audio", required=True, help="Reference audio path, URL, data URL, or file URI")
+    parser.add_argument("--ref-text", required=True, help="Transcript of the reference audio")
+    parser.add_argument("--stream", action="store_true", help="Enable streaming PCM output")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation")
+    parser.add_argument("--max-new-tokens", type=int, default=None, help="Optional maximum generated tokens")
     parser.add_argument(
-        "--ref-audio",
-        default=DEFAULT_REF_AUDIO,
-        help="Reference audio for voice cloning (path or URL)",
+        "--extra-params",
+        default=None,
+        help="Optional JSON object passed to the speech endpoint extra_params field",
     )
-    parser.add_argument(
-        "--ref-text",
-        default=DEFAULT_REF_TEXT,
-        help="Transcript of the reference audio",
-    )
-    parser.add_argument("--stream", action="store_true", help="Enable streaming (PCM output)")
     parser.add_argument(
         "--response-format",
         default="wav",
         choices=["wav", "mp3", "flac", "pcm", "aac", "opus"],
-        help="Audio format (default: wav)",
+        help="Audio format for non-streaming mode (default: wav)",
     )
     parser.add_argument("--output", "-o", default=None, help="Output file path")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
     run_tts(args)
 
 
